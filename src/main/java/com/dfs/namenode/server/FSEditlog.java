@@ -1,8 +1,5 @@
 package com.dfs.namenode.server;
 
-import sun.awt.image.ImageWatched;
-
-import java.nio.DoubleBuffer;
 import java.util.LinkedList;
 import java.util.List;
 
@@ -16,7 +13,20 @@ public class FSEditlog {
      */
     private long txidSeq = 0L;
 
+    // 内存双缓冲区
     private DoubleBuffer editLogBuffer = new DoubleBuffer();
+
+    // 当前是否在将内存缓冲刷入磁盘中
+    private volatile Boolean isSyncRunning = false;
+
+    // 当前是否有线程在等待刷新下一批edits log到磁盘里去
+    private volatile Boolean isWaitSync = false;
+
+    // 在同步到磁盘中的最大的一个txid
+    private volatile Long syncMaxTxid = 0L;
+
+    // 每个线程自己本地的txid副本
+    private ThreadLocal<Long> localTxid = new ThreadLocal<Long>();
 
     /**
      * 记录edits log日志
@@ -27,11 +37,54 @@ public class FSEditlog {
         synchronized (this) {
             txidSeq++;
             long txid = txidSeq;
+            localTxid.set(txid);
 
             // 构造一条Edits log对象
             EditLog log = new EditLog(txid,content);
             // 将edits log写入内存缓冲中，不是直接刷入磁盘文件
             editLogBuffer.write(log);
+        }
+    }
+
+    /**
+     * 将内存缓冲中的数据刷入磁盘文件中
+     */
+    private void logSync(){
+        // 再次尝试加锁
+        synchronized (this) {
+            // 如果说当前整好有人在刷内存缓冲到磁盘中去
+            if (isSyncRunning) {
+                long txid = localTxid.get();
+                if (txid < syncMaxTxid) {
+                    return;
+                }
+
+                if (isWaitSync) {
+                    return;
+                }
+                isWaitSync = true;
+                while (isSyncRunning) {
+                    try {
+                        wait(2000);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }
+                isWaitSync = false;
+            }
+
+            // 交换两块缓冲区
+            editLogBuffer.setReadyToSync();
+            syncMaxTxid = editLogBuffer.getSyncMaxTxid();
+            // 设置当前正在同步到磁盘的标志位
+            isSyncRunning = true;
+        }
+
+        editLogBuffer.flush();
+
+        synchronized (this) {
+            isSyncRunning = false;
+            notifyAll();
         }
     }
 
@@ -55,12 +108,12 @@ public class FSEditlog {
         /**
          * 是专门用来承载线程写入edits log
          */
-        List<EditLog> currentBuffer = new LinkedList<EditLog>();
+        LinkedList<EditLog> currentBuffer = new LinkedList<EditLog>();
 
         /**
          * 专门用来将数据同步到磁盘中去的一块缓冲
          */
-        List<EditLog> syncBuffer = new LinkedList<EditLog>();
+        LinkedList<EditLog> syncBuffer = new LinkedList<EditLog>();
 
         /**
          * 将edits log写到内存缓冲里去
@@ -74,9 +127,13 @@ public class FSEditlog {
          * 交换两块缓冲区，为了同步内存数据到磁盘做准备
          */
         public void setReadyToSync(){
-            List<EditLog> tmp = currentBuffer;
+            LinkedList<EditLog> tmp = currentBuffer;
             currentBuffer = syncBuffer;
             syncBuffer = tmp;
+        }
+
+        public Long getSyncMaxTxid(){
+            return syncBuffer.getLast().txid;
         }
 
         /**
